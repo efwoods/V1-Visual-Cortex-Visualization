@@ -1,4 +1,6 @@
 **/data/**
+**/example/generated_images/
+**/example/real_images/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
