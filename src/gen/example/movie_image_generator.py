@@ -35,7 +35,7 @@ class Generator(nn.Module):
             nn.ConvTranspose2d(128, 64, 4, 2, 1, bias=False),
             nn.BatchNorm2d(64), nn.ReLU(True),
             nn.ConvTranspose2d(64, 1, 4, 2, 1, bias=False),
-            nn.Tanh()
+            nn.Tanh(),
         )
 
     def forward(self, input):
