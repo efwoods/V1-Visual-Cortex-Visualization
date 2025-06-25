@@ -3,3 +3,4 @@ transforms
 numpy
 torchmetrics
 pillow
+tensorboard
