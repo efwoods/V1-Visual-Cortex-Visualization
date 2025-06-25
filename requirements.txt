@@ -4,3 +4,6 @@ numpy
 torchmetrics
 pillow
 tensorboard
+scikit-image 
+tqdm 
+matplotlib

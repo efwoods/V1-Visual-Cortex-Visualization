@@ -24,8 +24,78 @@ class WaveformEncoder(nn.Module):
 
     def forward(self, x):
         return self.encoder(x)
+
 ---
 
+# models/waveform_decoder.py
+import torch.nn as nn
+
+
+class WaveformDecoder(nn.Module):
+    def __init__(self, latent_dim=128, out_shape=(16, 48)):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(latent_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, out_shape[0] * out_shape[1]),
+        )
+        self.out_shape = out_shape
+
+    def forward(self, z):
+        x = self.fc(z)
+        return x.view(-1, *self.out_shape)
+
+---
+
+# models/image_decoder.py
+import torch.nn as nn
+
+
+class ImageDecoder(nn.Module):
+    def __init__(self, latent_dim=128, out_channels=3):
+        super().__init__()
+        self.fc = nn.Sequential(nn.Linear(latent_dim, 8 * 8 * 64), nn.ReLU())
+        self.deconv = nn.Sequential(
+            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),  # 16x16
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 16, 4, stride=2, padding=1),  # 32x32
+            nn.ReLU(),
+            nn.ConvTranspose2d(16, out_channels, 4, stride=2, padding=1),  # 64x64
+            nn.Sigmoid(),
+        )
+
+    def forward(self, z):
+        x = self.fc(z).view(-1, 64, 8, 8)
+        return self.deconv(x)
+
+
+---
+
+# models/image_encoder.py
+import torch.nn as nn
+import torchvision.models as models
+
+
+class ImageEncoder(nn.Module):
+    def __init__(self, latent_dim=128):
+        super().__init__()
+        base = models.resnet18(weights="IMAGENET1K_V1")
+        self.features = nn.Sequential(*list(base.children())[:-1])  # remove classifier
+        self.fc = nn.Linear(base.fc.in_features, latent_dim)
+
+    def forward(self, x):
+        x = self.features(x).squeeze()
+        return self.fc(x)
+
+
+---
+
+# utils.py
+import torch.nn.functional as F
+
+
+def latent_alignment_loss(z_image, z_waveform):
+    return F.mse_loss(z_image, z_waveform)
 
 
 ---
@@ -65,8 +135,73 @@ class ImageWaveformDataset(Dataset):
 
 ---
 
+
+---
+
+## Data Flow Diagram
+
+```
+     (Train Phase)
+   ┌──────────────┐
+   │  Image Input │
+   └──────┬───────┘
+          ▼
+  ┌─────────────────┐
+  │  Image Encoder  │  (ResNet / ViT)
+  └─────────────────┘
+          ▼
+    z_image_latent ───────┐
+                          ▼
+              ┌────────────────────┐
+              │  Waveform Decoder  │ (MLP or 1D CNN)
+              └────────────────────┘
+                          ▼
+                 Synthetic Waveform
+                          ▼
+              ┌────────────────────┐
+              │  Waveform Encoder  │
+              └────────────────────┘
+                          ▼
+    z_waveform_latent ◄────── latent alignment loss ──────► z_image_latent
+                          ▼
+              ┌──────────────────┐
+              │  Image Decoder   │
+              └──────────────────┘
+                          ▼
+               Reconstructed Image
+```
+
+```
+Simulation Path (How to See)
+Image ─▶ Image Encoder ─▶ z_image_latent ─▶ Waveform Decoder ─▶ Synthetic Waveform
+```
+
+```
+Reconstruction Path (How to Visualize Sight, Imagination, and Dreams)
+Waveform ─▶ Waveform Encoder ─▶ z_waveform_latent ─▶ Image Decoder ─▶ Reconstructed Image
+```
+
+## Model Project Architecture
+```
+project/
+├── data/
+│   ├── dataset.py             # Image + waveform loader
+├── models/
+│   ├── image_encoder.py       # CNN (ResNet) image → z
+│   ├── waveform_decoder.py    # MLP z → waveform
+│   ├── waveform_encoder.py    # MLP waveform → z
+│   ├── image_decoder.py       # CNN decoder z → image
+│   ├── __init__.py            # Shared architecture utils
+├── train.py                   # Trains everything (2 phases)
+├── eval.py                    # Runs SSIM, PSNR, MSE
+├── config.yaml                # Configurable hyperparams
+├── utils.py                   # Logger, metrics, visualizer
+└── README.md                  # Usage + dependencies
+```
+
+
 The ImageWaveformDataset does not have images. They are file paths and numpy waveforms. 
 
-there are approx .5 million samples of numpy waveforms and image file paths. to load all the images will be memory inefficient. Please load the data in batches by loading the images and waveforms in batches using the file paths provided at each sample and use those to train the neural network. 
+There are approximately .5 million samples of numpy waveforms and image file paths. Each image is of size (320, 240). To load all the images will be memory inefficient. Please load the data in batches by loading the images and waveforms in batches using the file paths provided at each sample and use those to train the neural network. 
 
 I need train.py. 
