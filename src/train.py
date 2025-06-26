@@ -17,6 +17,13 @@ from data.dataset import ImageWaveformDataset
 from utils import latent_alignment_loss
 import pickle
 
+from torchvision.models import vgg16
+from torchvision.models.feature_extraction import create_feature_extractor
+
+from torch.optim.lr_scheduler import LambdaLR
+
+PERCEPTUAL_WEIGHT = 0.1
+
 
 def load_config(path="config.yaml"):
     with open(path, "r") as f:
@@ -61,37 +68,50 @@ def main():
     writer = SummaryWriter(log_dir)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Transforms
-    transform = transforms.Compose([transforms.Resize((64, 64)), transforms.ToTensor()])
+    # Load pretrained VGG16 feature extractor for perceptual loss
+    vgg = vgg16(weights="IMAGENET1K_V1").features.eval().to(device)
+    for p in vgg.parameters():
+        p.requires_grad = False  # freeze weights
 
-    # Load data
+    # Create extractor for relu2_2 layer (layer index 16)
+    feature_extractor = create_feature_extractor(vgg, return_nodes={"16": "features"})
+
+    def perceptual_loss(img1, img2):
+        # Input: shape (B, 3, H, W), range [0,1]
+        return torch.nn.functional.mse_loss(
+            feature_extractor(img1)["features"], feature_extractor(img2)["features"]
+        )
+
+    # Data transforms
+    transform = transforms.Compose(
+        [transforms.Resize((224, 224)), transforms.ToTensor()]
+    )
+
+    # Load dataset dicts
     with open(config["waveform_dict_path"], "rb") as f:
         waveform_dict = pickle.load(f)
     with open(config["image_paths_dict_path"], "rb") as f:
         image_paths_dict = pickle.load(f)
 
-    # waveform_dict = torch.load(config["waveform_dict_path"])
-    # image_paths_dict = torch.load(config["image_paths_dict_path"])
-
     dataset = ImageWaveformDataset(waveform_dict, image_paths_dict, transform=transform)
 
-    # Split
+    # Split dataset into train/test
     test_ratio = 0.1
     test_size = int(test_ratio * len(dataset))
     train_size = len(dataset) - test_size
     train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
 
-    # Save the test data for later use
+    # Save test metadata
     test_metadata = {
         "indices": test_dataset.indices,
         "timestamp": datetime.datetime.now().isoformat(),
-        "split_ratio": 0.1,
+        "split_ratio": test_ratio,
         "total_samples": len(dataset),
     }
-
     with open("test_dataset_meta.pkl", "wb") as f:
         pickle.dump(test_metadata, f)
 
+    # Further split train into train/val
     val_ratio = 0.2
     val_size = int(val_ratio * len(train_dataset))
     train_size = len(train_dataset) - val_size
@@ -112,33 +132,13 @@ def main():
         pin_memory=True,
     )
 
-    # Load & rebuild test set for later use
-    # with open("test_indices.pkl", "rb") as f:
-    #     test_indices = pickle.load(f)
-
-    # # Recreate full dataset
-    # full_dataset = ImageWaveformDataset(
-    #     waveform_dict, image_paths_dict, transform=transform
-    # )
-
-    # # Rebuild test subset
-    # test_dataset = torch.utils.data.Subset(full_dataset, test_indices)
-
-    # test_loader = DataLoader(
-    #     test_dataset,
-    #     batch_size=config["batch_size"],
-    #     shuffle=False,
-    #     num_workers=4,
-    #     pin_memory=True,
-    # )
-
-    # Models
+    # Initialize models
     image_encoder = ImageEncoder(latent_dim=config["latent_dim"]).to(device)
     image_decoder = ImageDecoder(latent_dim=config["latent_dim"]).to(device)
     waveform_decoder = WaveformDecoder(latent_dim=config["latent_dim"]).to(device)
     waveform_encoder = WaveformEncoder(latent_dim=config["latent_dim"]).to(device)
 
-    # Optimizer
+    # Optimizer and LR scheduler
     optimizer = torch.optim.Adam(
         list(image_encoder.parameters())
         + list(image_decoder.parameters())
@@ -146,10 +146,9 @@ def main():
         + list(waveform_decoder.parameters()),
         lr=float(config["learning_rate"]),
     )
+    scheduler = LambdaLR(optimizer, lr_lambda=lambda epoch: min(1.0, epoch / 10))
 
     os.makedirs(config["checkpoint_dir"], exist_ok=True)
-
-    best_val_mse = float("inf")
 
     best_val_mse = float("inf")
     patience = 10
@@ -171,21 +170,34 @@ def main():
             waveforms = waveforms.to(device)
 
             # Forward pass
-            z_img = image_encoder(images)
+            z_img, _ = image_encoder(images)
             recon_waveform = waveform_decoder(z_img)
             z_waveform_from_img = waveform_encoder(recon_waveform)
 
             z_waveform = waveform_encoder(waveforms)
-            recon_image = image_decoder(z_waveform)
+            _, skip_feats = image_encoder(images)  # get skip features here
+            recon_image = image_decoder(
+                z_waveform, skip_feats
+            )  # <-- FIX: pass skip_feats
 
+            # Losses
             loss_align = latent_alignment_loss(z_img, z_waveform_from_img)
             loss_recon_image = torch.nn.functional.mse_loss(recon_image, images)
-            loss = loss_align + loss_recon_image
+            loss_perceptual = perceptual_loss(recon_image, images)
+
+            loss = loss_align + loss_recon_image + PERCEPTUAL_WEIGHT * loss_perceptual
 
             train_loss += loss.item()
 
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(image_encoder.parameters())
+                + list(image_decoder.parameters())
+                + list(waveform_encoder.parameters())
+                + list(waveform_decoder.parameters()),
+                max_norm=1.0,
+            )
             optimizer.step()
 
         avg_train_loss = train_loss / len(train_loader)
@@ -197,7 +209,6 @@ def main():
         waveform_decoder.eval()
 
         val_loss = 0
-        # val_mse, val_psnr, val_ssim = 0, 0, 0
         total_batches = 0
 
         with torch.no_grad():
@@ -206,32 +217,20 @@ def main():
                 waveforms = waveforms.to(device)
 
                 z_waveform = waveform_encoder(waveforms)
-                recon_image = image_decoder(z_waveform)
+                _, skip_feats = image_encoder(images)
+                recon_image = image_decoder(z_waveform, skip_feats)
 
                 loss = torch.nn.functional.mse_loss(recon_image, images)
                 val_loss += loss.item()
 
-                # batch_mse, batch_psnr, batch_ssim = evaluate_metrics(
-                #     recon_image, images
-                # )
-                # val_mse += batch_mse
-                # val_psnr += batch_psnr
-                # val_ssim += batch_ssim
                 total_batches += 1
 
         avg_val_loss = val_loss / len(val_loader)
-        # avg_val_mse = val_mse / total_batches
-        # avg_val_psnr = val_psnr / total_batches
-        # avg_val_ssim = val_ssim / total_batches
 
-        # TensorBoard Scalars (Save the metrics)
+        # TensorBoard Logging
         writer.add_scalar("Loss/train", avg_train_loss, epoch)
         writer.add_scalar("Loss/val", avg_val_loss, epoch)
-        # writer.add_scalar("Metrics/val_MSE", avg_val_mse, epoch)
-        # writer.add_scalar("Metrics/val_PSNR", avg_val_psnr, epoch)
-        # writer.add_scalar("Metrics/val_SSIM", avg_val_ssim, epoch)
 
-        # Log the images to tensorboard
         if epoch % 5 == 0:
             gt_img = tensor_to_image(images[0])
             rec_img = tensor_to_image(recon_image[0])
@@ -243,7 +242,7 @@ def main():
                 epoch,
             )
 
-        # Perform early stopping if there is no improvement
+        # Early stopping logic
         if avg_val_loss < best_val_mse:
             best_val_mse = avg_val_loss
             epochs_no_improve = 0
@@ -252,7 +251,6 @@ def main():
         else:
             epochs_no_improve += 1
             print(f"[EarlyStopping] No improvement for {epochs_no_improve} epoch(s)")
-
             if epochs_no_improve >= patience:
                 print(f"[EarlyStopping] Stopping early at epoch {epoch}")
                 early_stop = True
@@ -261,16 +259,13 @@ def main():
         print(
             f"\n[Epoch {epoch}] "
             f"Train Loss: {avg_train_loss:.6f} | "
-            f"Val Loss: {avg_val_loss:.6f} | "
-            # f"MSE: {avg_val_mse:.6f} | "
-            # f"PSNR: {avg_val_psnr:.2f} dB | "
-            # f"SSIM: {avg_val_ssim:.4f}"
+            f"Val Loss: {avg_val_loss:.6f}"
         )
 
-        # Save best model
+        # Save best models (simulation and relay parts)
         if avg_val_loss < best_val_mse:
             best_val_mse = avg_val_loss
-            # Save Simulation part: image_encoder + waveform_decoder
+
             torch.save(
                 {
                     "image_encoder": image_encoder.state_dict(),
@@ -281,7 +276,6 @@ def main():
                 os.path.join(config["checkpoint_dir"], "simulation_model.pt"),
             )
 
-            # Save Relay part: waveform_encoder + image_decoder
             torch.save(
                 {
                     "waveform_encoder": waveform_encoder.state_dict(),
@@ -295,7 +289,6 @@ def main():
                 f"[Checkpoint] Best simulation_model.pt and relay_model.pt saved at epoch {epoch} with MSE {avg_val_loss:.6f}"
             )
 
-        # Complete writing metrics for the current epoch before continuing
         writer.flush()
 
     writer.close()
