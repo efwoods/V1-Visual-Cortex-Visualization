@@ -144,7 +144,7 @@ def main():
         + list(image_decoder.parameters())
         + list(waveform_encoder.parameters())
         + list(waveform_decoder.parameters()),
-        lr=config["learning_rate"],
+        lr=float(config["learning_rate"]),
     )
 
     os.makedirs(config["checkpoint_dir"], exist_ok=True)
@@ -197,7 +197,7 @@ def main():
         waveform_decoder.eval()
 
         val_loss = 0
-        val_mse, val_psnr, val_ssim = 0, 0, 0
+        # val_mse, val_psnr, val_ssim = 0, 0, 0
         total_batches = 0
 
         with torch.no_grad():
@@ -211,25 +211,25 @@ def main():
                 loss = torch.nn.functional.mse_loss(recon_image, images)
                 val_loss += loss.item()
 
-                batch_mse, batch_psnr, batch_ssim = evaluate_metrics(
-                    recon_image, images
-                )
-                val_mse += batch_mse
-                val_psnr += batch_psnr
-                val_ssim += batch_ssim
+                # batch_mse, batch_psnr, batch_ssim = evaluate_metrics(
+                #     recon_image, images
+                # )
+                # val_mse += batch_mse
+                # val_psnr += batch_psnr
+                # val_ssim += batch_ssim
                 total_batches += 1
 
         avg_val_loss = val_loss / len(val_loader)
-        avg_val_mse = val_mse / total_batches
-        avg_val_psnr = val_psnr / total_batches
-        avg_val_ssim = val_ssim / total_batches
+        # avg_val_mse = val_mse / total_batches
+        # avg_val_psnr = val_psnr / total_batches
+        # avg_val_ssim = val_ssim / total_batches
 
         # TensorBoard Scalars (Save the metrics)
         writer.add_scalar("Loss/train", avg_train_loss, epoch)
         writer.add_scalar("Loss/val", avg_val_loss, epoch)
-        writer.add_scalar("Metrics/val_MSE", avg_val_mse, epoch)
-        writer.add_scalar("Metrics/val_PSNR", avg_val_psnr, epoch)
-        writer.add_scalar("Metrics/val_SSIM", avg_val_ssim, epoch)
+        # writer.add_scalar("Metrics/val_MSE", avg_val_mse, epoch)
+        # writer.add_scalar("Metrics/val_PSNR", avg_val_psnr, epoch)
+        # writer.add_scalar("Metrics/val_SSIM", avg_val_ssim, epoch)
 
         # Log the images to tensorboard
         if epoch % 5 == 0:
@@ -244,8 +244,8 @@ def main():
             )
 
         # Perform early stopping if there is no improvement
-        if avg_val_mse < best_val_mse:
-            best_val_mse = avg_val_mse
+        if avg_val_loss < best_val_mse:
+            best_val_mse = avg_val_loss
             epochs_no_improve = 0
             torch.save({...}, os.path.join(config["checkpoint_dir"], "best_model.pt"))
             print(f"[Checkpoint] Saved best model at epoch {epoch}")
@@ -262,14 +262,14 @@ def main():
             f"\n[Epoch {epoch}] "
             f"Train Loss: {avg_train_loss:.6f} | "
             f"Val Loss: {avg_val_loss:.6f} | "
-            f"MSE: {avg_val_mse:.6f} | "
-            f"PSNR: {avg_val_psnr:.2f} dB | "
-            f"SSIM: {avg_val_ssim:.4f}"
+            # f"MSE: {avg_val_mse:.6f} | "
+            # f"PSNR: {avg_val_psnr:.2f} dB | "
+            # f"SSIM: {avg_val_ssim:.4f}"
         )
 
         # Save best model
-        if avg_val_mse < best_val_mse:
-            best_val_mse = avg_val_mse
+        if avg_val_loss < best_val_mse:
+            best_val_mse = avg_val_loss
             torch.save(
                 {
                     "image_encoder": image_encoder.state_dict(),
@@ -282,7 +282,7 @@ def main():
                 os.path.join(config["checkpoint_dir"], "best_model.pt"),
             )
             print(
-                f"[Checkpoint] Best model saved at epoch {epoch} with MSE {avg_val_mse:.6f}"
+                f"[Checkpoint] Best model saved at epoch {epoch} with MSE {avg_val_loss:.6f}"
             )
         # Complete writing metrics for the current epoch before continuing
         writer.flush()
