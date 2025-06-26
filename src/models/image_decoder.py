@@ -23,15 +23,36 @@ class ImageDecoder(nn.Module):
         )
 
     def forward(self, z, skip_connections):
-        x = self.fc(z).view(-1, 256, 8, 8)
+        # Initial projection from latent vector
+        x = self.fc(z).view(-1, 256, 8, 8)  # Initialize x from latent z
+        # print(f"x initial shape: {x.shape}")
+        # print(f"skip_connections shapes: {[s.shape for s in skip_connections]}")
 
-        x = torch.cat([x, skip_connections[0]], dim=1)  # +256 → 512
+        # Ensure skip[0] matches x
+        skip0 = skip_connections[0]
+        if skip0.shape[2:] != x.shape[2:]:
+            skip0 = torch.nn.functional.interpolate(
+                skip0, size=x.shape[2:], mode="nearest"
+            )
+        x = torch.cat([x, skip0], dim=1)  # +256 → 512
         x = self.up1(x)
 
-        x = torch.cat([x, skip_connections[1]], dim=1)  # +128 → 256
+        # up1 output shape is probably (B, 256, 16, 16), match with skip1
+        skip1 = skip_connections[1]
+        if skip1.shape[2:] != x.shape[2:]:
+            skip1 = torch.nn.functional.interpolate(
+                skip1, size=x.shape[2:], mode="nearest"
+            )
+        x = torch.cat([x, skip1], dim=1)  # +128 → 256
         x = self.up2(x)
 
-        x = torch.cat([x, skip_connections[2]], dim=1)  # +64 → 128
+        # up2 output shape is probably (B, 128, 32, 32), match with skip2
+        skip2 = skip_connections[2]
+        if skip2.shape[2:] != x.shape[2:]:
+            skip2 = torch.nn.functional.interpolate(
+                skip2, size=x.shape[2:], mode="nearest"
+            )
+        x = torch.cat([x, skip2], dim=1)  # +64 → 128
         x = self.up3(x)
 
         return x

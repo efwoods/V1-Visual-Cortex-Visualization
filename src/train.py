@@ -182,6 +182,11 @@ def main():
 
             # Losses
             loss_align = latent_alignment_loss(z_img, z_waveform_from_img)
+            # Upsample recon_image from 64x64 to 224x224 to match ground truth and VGG
+            recon_image = torch.nn.functional.interpolate(
+                recon_image, size=(224, 224), mode="bilinear", align_corners=False
+            )
+
             loss_recon_image = torch.nn.functional.mse_loss(recon_image, images)
             loss_perceptual = perceptual_loss(recon_image, images)
 
@@ -219,6 +224,9 @@ def main():
                 z_waveform = waveform_encoder(waveforms)
                 _, skip_feats = image_encoder(images)
                 recon_image = image_decoder(z_waveform, skip_feats)
+                recon_image = torch.nn.functional.interpolate(
+                    recon_image, size=(224, 224), mode="bilinear", align_corners=False
+                )
 
                 loss = torch.nn.functional.mse_loss(recon_image, images)
                 val_loss += loss.item()
