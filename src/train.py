@@ -273,13 +273,21 @@ def main():
             torch.save(
                 {
                     "image_encoder": image_encoder.state_dict(),
-                    "image_decoder": image_decoder.state_dict(),
-                    "waveform_encoder": waveform_encoder.state_dict(),
                     "waveform_decoder": waveform_decoder.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "epoch": epoch,
                 },
-                os.path.join(config["checkpoint_dir"], "best_model.pt"),
+                os.path.join(config["checkpoint_dir"], "simulation_model.pt"),
+            )
+
+            torch.save(
+                {
+                    "waveform_encoder": waveform_encoder.state_dict(),
+                    "image_decoder": image_decoder.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "epoch": epoch,
+                },
+                os.path.join(config["checkpoint_dir"], "relay_model.pt"),
             )
             print(
                 f"[Checkpoint] Best model saved at epoch {epoch} with MSE {avg_val_loss:.6f}"
