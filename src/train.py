@@ -54,6 +54,7 @@ def evaluate_metrics(image_preds, image_targets):
 
 def main():
     config = load_config()
+
     log_dir = os.path.join(
         "runs", datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     )
@@ -75,7 +76,6 @@ def main():
     dataset = ImageWaveformDataset(waveform_dict, image_paths_dict, transform=transform)
 
     # Split
-
     test_ratio = 0.1
     test_size = int(test_ratio * len(dataset))
     train_size = len(dataset) - test_size
