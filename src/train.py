@@ -270,20 +270,31 @@ def main():
         # Save best model
         if avg_val_loss < best_val_mse:
             best_val_mse = avg_val_loss
+            # Save Simulation part: image_encoder + waveform_decoder
             torch.save(
                 {
                     "image_encoder": image_encoder.state_dict(),
-                    "image_decoder": image_decoder.state_dict(),
-                    "waveform_encoder": waveform_encoder.state_dict(),
                     "waveform_decoder": waveform_decoder.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "epoch": epoch,
                 },
-                os.path.join(config["checkpoint_dir"], "best_model.pt"),
+                os.path.join(config["checkpoint_dir"], "simulation_model.pt"),
+            )
+
+            # Save Relay part: waveform_encoder + image_decoder
+            torch.save(
+                {
+                    "waveform_encoder": waveform_encoder.state_dict(),
+                    "image_decoder": image_decoder.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "epoch": epoch,
+                },
+                os.path.join(config["checkpoint_dir"], "relay_model.pt"),
             )
             print(
-                f"[Checkpoint] Best model saved at epoch {epoch} with MSE {avg_val_loss:.6f}"
+                f"[Checkpoint] Best simulation_model.pt and relay_model.pt saved at epoch {epoch} with MSE {avg_val_loss:.6f}"
             )
+
         # Complete writing metrics for the current epoch before continuing
         writer.flush()
 
