@@ -7,7 +7,9 @@ import torchvision.models as models
 class ImageEncoder(nn.Module):
     def __init__(self, latent_dim=128):
         super().__init__()
-        base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        base = models.resnet18(
+            weights=models.ResNet18_Weights.IMAGENET1K_V1
+        )  # This was trained on 1.2 million images to extract textures, shapes, & semantic features
         # Decompose layers for access to intermediate features
         self.conv1 = base.conv1  # output: 64@112x112 (after stride=2)
         self.bn1 = base.bn1
@@ -27,17 +29,17 @@ class ImageEncoder(nn.Module):
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
-        skip0 = x  # 64@112x112
+        skip0 = x  # 64@112x112 (low-level edges/textures)
 
         x = self.maxpool(x)
         x = self.layer1(x)
-        skip1 = x  # 64@56x56
+        skip1 = x  # 64@56x56 (basic-shapes)
 
         x = self.layer2(x)
-        skip2 = x  # 128@28x28
+        skip2 = x  # 128@28x28 (parts of objects)
 
         x = self.layer3(x)
-        skip3 = x  # 256@14x14
+        skip3 = x  # 256@14x14 (semantic parts of an image)
 
         x = self.layer4(x)  # 512@7x7
         pooled = self.avgpool(x)

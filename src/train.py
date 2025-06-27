@@ -1,3 +1,4 @@
+# train.py
 import os
 import datetime
 import pickle
@@ -27,6 +28,73 @@ import torchvision.utils as vutils
 PERCEPTUAL_WEIGHT = 0.1
 USE_PERCEPTUAL_LOSS = False  # Set True to enable
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+LOAD_FROM_CHECKPOINT = False
+
+
+def load_all_from_checkpoint(
+    image_enc, wave_enc, image_dec, wave_dec, optimizer, config, path=None
+):
+    if path is None:
+        path = os.path.join(
+            config["checkpoint_dir"], "checkpoint.pt"
+        )  # Assuming checkpoint
+    checkpoint = torch.load(path)
+    image_enc.load_state_dict(
+        torch.load(os.path.join(config["checkpoint_dir"], "image_encoder.pt"))
+    )
+    wave_enc.load_state_dict(
+        torch.load(os.path.join(config["checkpoint_dir"], "waveform_encoder.pt"))
+    )
+    image_dec.load_state_dict(
+        torch.load(os.path.join(config["checkpoint_dir"], "image_decoder.pt"))
+    )
+    wave_dec.load_state_dict(
+        torch.load(os.path.join(config["checkpoint_dir"], "waveform_decoder.pt"))
+    )
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    return checkpoint["epoch"] + 1, checkpoint["best_val"]
+
+
+def save_all_to_checkpoint(
+    config,
+    image_enc,
+    wave_enc,
+    image_dec,
+    wave_dec,
+    optimizer,
+    epoch,
+    best_val,
+    path=None,
+):
+    os.makedirs(config["checkpoint_dir"], exist_ok=True)
+    if path is None:
+        path = os.path.join(config["checkpoint_dir"], "checkpoint.pt")
+    checkpoint = {
+        "optimizer": optimizer.state_dict(),
+        "epoch": epoch,
+        "best_val": best_val,
+    }
+    torch.save(checkpoint, path)
+
+    torch.save(
+        image_enc.state_dict(),
+        os.path.join(config["checkpoint_dir"], "image_encoder.pt"),
+    )
+    torch.save(
+        wave_enc.state_dict(),
+        os.path.join(config["checkpoint_dir"], "waveform_encoder.pt"),
+    )
+    torch.save(
+        image_dec.state_dict(),
+        os.path.join(config["checkpoint_dir"], "image_decoder.pt"),
+    )
+    torch.save(
+        wave_dec.state_dict(),
+        os.path.join(config["checkpoint_dir"], "waveform_decoder.pt"),
+    )
+
+    print(f"Saved best_model at epoch {epoch}")
+    print(f"Best validation loss: {best_val}")
 
 
 # Perceptual loss setup
@@ -82,8 +150,10 @@ def log_side_by_side_images(
 
 
 def main():
+
     config = load_config()
     # TensorBoard
+    os.makedirs("runs", exist_ok=True)
     logdir = os.path.join("runs", datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
     writer = SummaryWriter(logdir)
 
@@ -175,7 +245,12 @@ def main():
 
     best_val = float("inf")
     epochs_no_improve = 0
-    for epoch in range(1, config["epochs"] + 1):
+    start_epoch = 1
+    if LOAD_FROM_CHECKPOINT:
+        start_epoch, best_val = load_all_from_checkpoint(
+            image_enc, wave_enc, image_dec, wave_dec, optimizer, config=config
+        )
+    for epoch in range(start_epoch, config["epochs"] + 1):
         # Train
         image_enc.train()
         image_dec.train()
@@ -290,35 +365,22 @@ def main():
         print(f"Epoch {epoch}: Train={avg_train:.4f}, Val={avg_val:.4f}")
 
         # Checkpoint
+
         if avg_val < best_val:
             best_val = avg_val
             epochs_no_improve = 0
-            ckpt = {
-                "image_enc": image_enc.state_dict(),
-                "wave_enc": wave_enc.state_dict(),
-                "image_dec": image_dec.state_dict(),
-                "wave_dec": wave_dec.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "epoch": epoch,
-            }
-            os.makedirs(config["checkpoint_dir"], exist_ok=True)
-            torch.save(
-                image_enc.state_dict(),
-                os.path.join(config["checkpoint_dir"], "image_encoder.pt"),
+
+            save_all_to_checkpoint(
+                image_enc=image_enc,
+                wave_enc=wave_enc,
+                image_dec=image_dec,
+                wave_dec=wave_dec,
+                optimizer=optimizer,
+                epoch=epoch,
+                best_val=best_val,
+                config=config,
             )
-            torch.save(
-                wave_enc.state_dict(),
-                os.path.join(config["checkpoint_dir"], "waveform_encoder.pt"),
-            )
-            torch.save(
-                image_dec.state_dict(),
-                os.path.join(config["checkpoint_dir"], "image_decoder.pt"),
-            )
-            torch.save(
-                wave_dec.state_dict(),
-                os.path.join(config["checkpoint_dir"], "waveform_decoder.pt"),
-            )
-            print(f"Saved best_model at epoch {epoch}")
+
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= config.get("patience", 10):
