@@ -1,10 +1,10 @@
 # config.yaml
 latent_dim: 128
-batch_size: 32
+original_batch_size: 32
+batch_size: 128
 learning_rate: 1e-4
 epochs: 100
 save_every: 10
 checkpoint_dir: checkpoints/
-
 waveform_dict_path: data/collected_stimulus_waveforms.pkl
 image_paths_dict_path: data/image_paths_dict.pkl

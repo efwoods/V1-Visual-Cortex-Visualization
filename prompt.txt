@@ -1,14 +1,458 @@
-# config.yaml
-latent_dim: 128
-batch_size: 32
-learning_rate: 1e-4
-epochs: 100
-save_every: 10
-checkpoint_dir: checkpoints/
+I need to fix train.py to reflect this architecture.
 
-waveform_dict_path: data/collected_stimulus_waveforms.pkl
-image_paths_dict_path: data/image_paths_dict.pkl
+from torch.utils.tensorboard import SummaryWriter
+import datetime
+import os
+import yaml
+import torch
+from torch.utils.data import DataLoader, random_split
+from torchvision import transforms
+from tqdm import tqdm
+import numpy as np
+from skimage.metrics import structural_similarity as compare_ssim
+from skimage.metrics import peak_signal_noise_ratio as compare_psnr
+from models.image_encoder import ImageEncoder
+from models.image_decoder import ImageDecoder
+from models.waveform_decoder import WaveformDecoder
+from models.waveform_encoder import WaveformEncoder
+from data.dataset import ImageWaveformDataset
+from utils import latent_alignment_loss
+import pickle
 
+from torchvision.models import vgg16
+from torchvision.models.feature_extraction import create_feature_extractor
+
+from torch.optim.lr_scheduler import LambdaLR
+
+# Settings
+
+PERCEPTUAL_WEIGHT = 0.1
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Load pretrained VGG16 feature extractor for perceptual loss
+vgg = vgg16(weights="IMAGENET1K_V1").features.eval().to(device)
+for p in vgg.parameters():
+    p.requires_grad = False  # freeze weights
+
+
+# Functions
+def perceptual_loss(img1, img2, feature_extractor):
+    # Input: shape (B, 3, H, W), range [0,1]
+    return torch.nn.functional.mse_loss(
+        feature_extractor(img1)["features"], feature_extractor(img2)["features"]
+    )
+
+
+def load_config(path="config.yaml"):
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+
+
+def tensor_to_image(tensor):
+    img = tensor.detach().cpu().numpy()
+    img = np.transpose(img, (1, 2, 0))  # CHW -> HWC
+    img = np.clip(img, 0, 1)
+    return img
+
+
+@torch.no_grad()
+def evaluate_metrics(image_preds, image_targets):
+    print(f"Max memory: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB")
+    batch_size = image_preds.shape[0]
+    mse_total = 0.0
+    psnr_total = 0.0
+    ssim_total = 0.0
+
+    for i in range(batch_size):
+        pred = tensor_to_image(image_preds[i])
+        target = tensor_to_image(image_targets[i])
+
+        mse = np.mean((pred - target) ** 2)
+        psnr = compare_psnr(target, pred, data_range=1.0)
+        ssim = compare_ssim(target, pred, multichannel=True, data_range=1.0)
+
+        mse_total += mse
+        psnr_total += psnr
+        ssim_total += ssim
+
+    return mse_total / batch_size, psnr_total / batch_size, ssim_total / batch_size
+
+
+def main():
+    config = load_config()
+
+    log_dir = os.path.join(
+        "runs", datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    )
+    writer = SummaryWriter(log_dir)
+
+    # Create extractor for relu2_2 layer (layer index 16)
+    feature_extractor = create_feature_extractor(vgg, return_nodes={"16": "features"})
+
+    # Data transforms
+    transform = transforms.Compose(
+        [transforms.Resize((224, 224)), transforms.ToTensor()]
+    )
+
+    # Load dataset dicts
+    with open(config["waveform_dict_path"], "rb") as f:
+        waveform_dict = pickle.load(f)
+    with open(config["image_paths_dict_path"], "rb") as f:
+        image_paths_dict = pickle.load(f)
+
+    dataset = ImageWaveformDataset(waveform_dict, image_paths_dict, transform=transform)
+
+    # Split dataset into train/test
+    test_ratio = 0.1
+    test_size = int(test_ratio * len(dataset))
+    train_size = len(dataset) - test_size
+    train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+
+    # Save test metadata
+    test_metadata = {
+        "indices": test_dataset.indices,
+        "timestamp": datetime.datetime.now().isoformat(),
+        "split_ratio": test_ratio,
+        "total_samples": len(dataset),
+    }
+    with open("test_dataset_meta.pkl", "wb") as f:
+        pickle.dump(test_metadata, f)
+
+    # Further split train into train/val
+    val_ratio = 0.2
+    val_size = int(val_ratio * len(train_dataset))
+    train_size = len(train_dataset) - val_size
+    train_dataset, val_dataset = random_split(train_dataset, [train_size, val_size])
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config["batch_size"],
+        shuffle=True,
+        num_workers=min(16, os.cpu_count()),
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config["batch_size"],
+        shuffle=False,
+        num_workers=min(16, os.cpu_count()),
+        pin_memory=True,
+    )
+
+    # Initialize models
+    image_encoder = ImageEncoder(latent_dim=config["latent_dim"]).to(device)
+    image_decoder = ImageDecoder(latent_dim=config["latent_dim"]).to(device)
+    waveform_decoder = WaveformDecoder(latent_dim=config["latent_dim"]).to(device)
+    waveform_encoder = WaveformEncoder(latent_dim=config["latent_dim"]).to(device)
+
+    if torch.__version__ >= "2.0.0":
+        image_encoder = torch.compile(image_encoder)
+        image_decoder = torch.compile(image_decoder)
+        waveform_encoder = torch.compile(waveform_encoder)
+        waveform_decoder = torch.compile(waveform_decoder)
+
+    # Optimizer and LR scheduler
+    optimizer = torch.optim.Adam(
+        list(image_encoder.parameters())
+        + list(image_decoder.parameters())
+        + list(waveform_encoder.parameters())
+        + list(waveform_decoder.parameters()),
+        lr=float(config["learning_rate"]),
+    )
+    scheduler = LambdaLR(optimizer, lr_lambda=lambda epoch: min(1.0, epoch / 10))
+
+    os.makedirs(config["checkpoint_dir"], exist_ok=True)
+
+    best_val_mse = float("inf")
+    patience = 10
+    epochs_no_improve = 0
+    early_stop = False
+
+    print("CUDA available:", torch.cuda.is_available())
+    print("Device:", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+
+    for epoch in range(1, config["epochs"] + 1):
+        # ---------- Training ----------
+        image_encoder.train()
+        image_decoder.train()
+        waveform_encoder.train()
+        waveform_decoder.train()
+
+        train_loss = 0
+        for images, waveforms in tqdm(
+            train_loader, desc=f"[Train] Epoch {epoch}/{config['epochs']}"
+        ):
+            images = images.to(device)
+            waveforms = waveforms.to(device)
+
+            # Forward pass (Image ─▶ Image Encoder ─▶ image_latent_space ─▶ Waveform Decoder ─▶ Synthetic Waveform ─▶ Waveform ─▶ Waveform Encoder ─▶ (waveform-latent))
+            image_latents, skip_feats = image_encoder(images)
+            synthetic_waveform = waveform_decoder(image_latents)
+            waveform_latent = waveform_encoder(synthetic_waveform)
+
+            # Reconstruction Path (How to Visualize Sight, Imagination, and Dreams)
+            # waveform_latent ─▶ Image Decoder ─▶ Reconstructed Image
+            waveform_latent = waveform_encoder(waveforms)
+            # _, skip_feats = image_encoder(images)  # get skip features here
+            reconstructed_image = image_decoder(
+                z_waveform, skip_feats
+            )  # <-- FIX: pass skip_feats
+
+            # Losses
+            loss_align = latent_alignment_loss(image_latents, waveform_latent)
+            # Upsample reconstructed_image from 64x64 to 224x224 to match ground truth and VGG
+            reconstructed_image = torch.nn.functional.interpolate(
+                reconstructed_image,
+                size=(224, 224),
+                mode="bilinear",
+                align_corners=False,
+            )
+
+            loss_reconstructed_image = torch.nn.functional.mse_loss(
+                reconstructed_image, images
+            )
+            loss_perceptual = perceptual_loss(reconstructed_image, images)
+
+            loss = (
+                loss_align
+                + loss_reconstructed_image
+                + PERCEPTUAL_WEIGHT * loss_perceptual
+            )
+
+            train_loss += loss.item()
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(image_encoder.parameters())
+                + list(image_decoder.parameters())
+                + list(waveform_encoder.parameters())
+                + list(waveform_decoder.parameters()),
+                max_norm=1.0,
+            )
+            optimizer.step()
+
+        avg_train_loss = train_loss / len(train_loader)
+
+        # ---------- Validation ----------
+        image_encoder.eval()
+        image_decoder.eval()
+        waveform_encoder.eval()
+        waveform_decoder.eval()
+
+        val_loss = 0
+        total_batches = 0
+
+        with torch.no_grad():
+            for images, waveforms in tqdm(val_loader, desc="[Val] Evaluating"):
+                images = images.to(device)
+                waveforms = waveforms.to(device)
+
+                image_latents, skip_feats = image_encoder(images)
+                waveform_latents = waveform_encoder(waveforms)
+
+                recon_image = image_decoder(z_waveform, skip_feats)
+                recon_image = torch.nn.functional.interpolate(
+                    recon_image, size=(224, 224), mode="bilinear", align_corners=False
+                )
+
+                loss = torch.nn.functional.mse_loss(recon_image, images)
+                val_loss += loss.item()
+
+                total_batches += 1
+
+        avg_val_loss = val_loss / len(val_loader)
+
+        # TensorBoard Logging
+        writer.add_scalar("Loss/train", avg_train_loss, epoch)
+        writer.add_scalar("Loss/val", avg_val_loss, epoch)
+        writer.add_scalar(
+            "Norm/image_latents", image_latent_space.norm(p=2, dim=1).mean(), epoch
+        )
+        writer.add_scalar(
+            "Norm/z_waveform", waveform_latent.norm(p=2, dim=1).mean(), epoch
+        )
+
+        if epoch % 5 == 0:
+            gt_img = tensor_to_image(images[0])
+            rec_img = tensor_to_image(recon_image[0])
+            gt_tensor = torch.tensor(gt_img).permute(2, 0, 1).unsqueeze(0)
+            rec_tensor = torch.tensor(rec_img).permute(2, 0, 1).unsqueeze(0)
+            writer.add_images(
+                "GroundTruth vs Reconstruction",
+                torch.cat([gt_tensor, rec_tensor], dim=0),
+                epoch,
+            )
+
+        # Early stopping logic
+        if avg_val_loss < best_val_mse:
+            best_val_mse = avg_val_loss
+            epochs_no_improve = 0
+            torch.save({...}, os.path.join(config["checkpoint_dir"], "best_model.pt"))
+            print(f"[Checkpoint] Saved best model at epoch {epoch}")
+        else:
+            epochs_no_improve += 1
+            print(f"[EarlyStopping] No improvement for {epochs_no_improve} epoch(s)")
+            if epochs_no_improve >= patience:
+                print(f"[EarlyStopping] Stopping early at epoch {epoch}")
+                early_stop = True
+                break
+
+        print(
+            f"\n[Epoch {epoch}] "
+            f"Train Loss: {avg_train_loss:.6f} | "
+            f"Val Loss: {avg_val_loss:.6f}"
+        )
+
+        # Save best models (simulation and relay parts)
+        if avg_val_loss < best_val_mse:
+            best_val_mse = avg_val_loss
+
+            torch.save(
+                {
+                    "image_encoder": image_encoder.state_dict(),
+                    "waveform_decoder": waveform_decoder.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "epoch": epoch,
+                },
+                os.path.join(config["checkpoint_dir"], "simulation_model.pt"),
+            )
+
+            torch.save(
+                {
+                    "waveform_encoder": waveform_encoder.state_dict(),
+                    "image_decoder": image_decoder.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "epoch": epoch,
+                },
+                os.path.join(config["checkpoint_dir"], "relay_model.pt"),
+            )
+            print(
+                f"[Checkpoint] Best simulation_model.pt and relay_model.pt saved at epoch {epoch} with MSE {avg_val_loss:.6f}"
+            )
+
+        writer.flush()
+
+    writer.close()
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+
+# models/image_decoder.py
+import torch
+import torch.nn as nn
+import torchvision.models as models
+
+
+class ImageDecoder(nn.Module):
+    def __init__(self, latent_dim=128, out_channels=3):
+        super().__init__()
+        self.fc = nn.Sequential(nn.Linear(latent_dim, 8 * 8 * 256), nn.ReLU())
+
+        self.up1 = nn.Sequential(
+            nn.ConvTranspose2d(512, 128, 4, stride=2, padding=1),  # 8→16
+            nn.ReLU(),
+        )
+        self.up2 = nn.Sequential(
+            nn.ConvTranspose2d(256, 64, 4, stride=2, padding=1),  # 16→32
+            nn.ReLU(),
+        )
+        self.up3 = nn.Sequential(
+            nn.ConvTranspose2d(128, out_channels, 4, stride=2, padding=1),  # 32→64
+            nn.Sigmoid(),
+        )
+
+    def forward(self, z, skip_connections):
+        # Initial projection from latent vector
+        x = self.fc(z).view(-1, 256, 8, 8)  # Initialize x from latent z
+        # print(f"x initial shape: {x.shape}")
+        # print(f"skip_connections shapes: {[s.shape for s in skip_connections]}")
+
+        # Ensure skip[0] matches x
+        skip0 = skip_connections[0]
+        if skip0.shape[2:] != x.shape[2:]:
+            skip0 = torch.nn.functional.interpolate(
+                skip0, size=x.shape[2:], mode="nearest"
+            )
+        x = torch.cat([x, skip0], dim=1)  # +256 → 512
+        x = self.up1(x)
+
+        # up1 output shape is probably (B, 256, 16, 16), match with skip1
+        skip1 = skip_connections[1]
+        if skip1.shape[2:] != x.shape[2:]:
+            skip1 = torch.nn.functional.interpolate(
+                skip1, size=x.shape[2:], mode="nearest"
+            )
+        x = torch.cat([x, skip1], dim=1)  # +128 → 256
+        x = self.up2(x)
+
+        # up2 output shape is probably (B, 128, 32, 32), match with skip2
+        skip2 = skip_connections[2]
+        if skip2.shape[2:] != x.shape[2:]:
+            skip2 = torch.nn.functional.interpolate(
+                skip2, size=x.shape[2:], mode="nearest"
+            )
+        x = torch.cat([x, skip2], dim=1)  # +64 → 128
+        x = self.up3(x)
+
+        return x
+---
+
+# models/image_encoder
+import torch
+import torch.nn as nn
+import torchvision.models as models
+
+
+class ImageEncoder(nn.Module):
+    def __init__(self, latent_dim=128):
+        super().__init__()
+        base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        # Decompose layers for access to intermediate features
+        self.conv1 = base.conv1  # output: 64@112x112 (after stride=2)
+        self.bn1 = base.bn1
+        self.relu = base.relu
+        self.maxpool = base.maxpool  # output: 64@56x56
+
+        self.layer1 = base.layer1  # 64@56x56
+        self.layer2 = base.layer2  # 128@28x28
+        self.layer3 = base.layer3  # 256@14x14
+        self.layer4 = base.layer4  # 512@7x7
+
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.flatten = nn.Flatten()
+        self.fc = nn.Linear(512, latent_dim)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        skip0 = x  # 64@112x112
+
+        x = self.maxpool(x)
+        x = self.layer1(x)
+        skip1 = x  # 64@56x56
+
+        x = self.layer2(x)
+        skip2 = x  # 128@28x28
+
+        x = self.layer3(x)
+        skip3 = x  # 256@14x14
+
+        x = self.layer4(x)  # 512@7x7
+        pooled = self.avgpool(x)
+        flat = self.flatten(pooled)
+        latent = self.fc(flat)
+
+        # Select which skip features to pass to decoder
+        # Adjust sizes as necessary for your decoder
+        # Here, pass three skip tensors (skip3, skip2, skip1) for your decoder's expected dims
+        return latent, (skip3, skip2, skip1)
 ---
 
 # models/waveform_encoder.py
@@ -32,62 +476,18 @@ import torch.nn as nn
 
 
 class WaveformDecoder(nn.Module):
-    def __init__(self, latent_dim=128, out_shape=(16, 48)):
+    def __init__(self, latent_dim=128, channels=1, length=768):
         super().__init__()
         self.fc = nn.Sequential(
-            nn.Linear(latent_dim, 512),
+            nn.Linear(latent_dim, 256),
             nn.ReLU(),
-            nn.Linear(512, out_shape[0] * out_shape[1]),
-        )
-        self.out_shape = out_shape
-
-    def forward(self, z):
-        x = self.fc(z)
-        return x.view(-1, *self.out_shape)
-
----
-
-# models/image_decoder.py
-import torch.nn as nn
-
-
-class ImageDecoder(nn.Module):
-    def __init__(self, latent_dim=128, out_channels=3):
-        super().__init__()
-        self.fc = nn.Sequential(nn.Linear(latent_dim, 8 * 8 * 64), nn.ReLU())
-        self.deconv = nn.Sequential(
-            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),  # 16x16
+            nn.Linear(256, 512),
             nn.ReLU(),
-            nn.ConvTranspose2d(32, 16, 4, stride=2, padding=1),  # 32x32
-            nn.ReLU(),
-            nn.ConvTranspose2d(16, out_channels, 4, stride=2, padding=1),  # 64x64
-            nn.Sigmoid(),
+            nn.Linear(512, length),
         )
 
     def forward(self, z):
-        x = self.fc(z).view(-1, 64, 8, 8)
-        return self.deconv(x)
-
-
----
-
-# models/image_encoder.py
-import torch.nn as nn
-import torchvision.models as models
-
-
-class ImageEncoder(nn.Module):
-    def __init__(self, latent_dim=128):
-        super().__init__()
-        base = models.resnet18(weights="IMAGENET1K_V1")
-        self.features = nn.Sequential(*list(base.children())[:-1])  # remove classifier
-        self.fc = nn.Linear(base.fc.in_features, latent_dim)
-
-    def forward(self, x):
-        x = self.features(x).squeeze()
-        return self.fc(x)
-
-
+        return self.fc(z).view(-1, 16, 48)
 ---
 
 # utils.py
@@ -95,46 +495,10 @@ import torch.nn.functional as F
 
 
 def latent_alignment_loss(z_image, z_waveform):
-    return F.mse_loss(z_image, z_waveform)
-
-
----
-
-# data/dataset.py
-import os
-from PIL import Image
-import numpy as np
-import torch
-from torch.utils.data import Dataset
-
-
-class ImageWaveformDataset(Dataset):
-    def __init__(self, waveform_dict, image_paths_dict, transform=None):
-        self.samples = []
-        self.transform = transform
-
-        for c in range(120):
-            c_key = f"condition_{c:03d}"
-            for e in range(16):
-                e_key = f"electrode_{e:02d}"
-                waveforms = waveform_dict[c][e]
-                image_paths = image_paths_dict[c_key][e_key]
-                for i in range(waveforms.shape[0]):
-                    self.samples.append((waveforms[i], image_paths[i]))
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        waveform, image_path = self.samples[idx]
-        image = Image.open(image_path).convert("RGB")
-        if self.transform:
-            image = self.transform(image)
-        waveform = torch.tensor(waveform, dtype=torch.float32)  # shape (16, 48)
-        return image, waveform
-
----
-
+    mse = F.mse_loss(z_image, z_waveform)
+    # Assymetric alignment with cosine similarity may add structure
+    cos = 1 - F.cosine_similarity(z_image, z_waveform).mean()
+    return mse + 0.5 * cos
 
 ---
 
@@ -150,7 +514,7 @@ class ImageWaveformDataset(Dataset):
   │  Image Encoder  │  (ResNet / ViT)
   └─────────────────┘
           ▼
-    z_image_latent ───────┐
+    image_latent_space ───┐
                           ▼
               ┌────────────────────┐
               │  Waveform Decoder  │ (MLP or 1D CNN)
@@ -162,7 +526,7 @@ class ImageWaveformDataset(Dataset):
               │  Waveform Encoder  │
               └────────────────────┘
                           ▼
-    z_waveform_latent ◄────── latent alignment loss ──────► z_image_latent
+    waveform_latent ◄────── latent alignment loss ──────► image_latent_space
                           ▼
               ┌──────────────────┐
               │  Image Decoder   │
@@ -171,14 +535,25 @@ class ImageWaveformDataset(Dataset):
                Reconstructed Image
 ```
 
+
+The simulation path may accept a real waveform or a synthetic waveform.
+
+
+The Image encoder, waveform decoder, waveform encoder, and image decoder are all individual modular models. 
+
 ```
-Simulation Path (How to See)
-Image ─▶ Image Encoder ─▶ z_image_latent ─▶ Waveform Decoder ─▶ Synthetic Waveform
+Simulation Path (How to See) (websocket api)
+Image ─▶ Image Encoder ─▶ image_latent_space ─▶ Waveform Decoder ─▶ Synthetic (or real) Waveform ─▶ Waveform Encoder ─▶ (waveform_latent)
+
+OR
+
+Synthetic (or real) Waveform ─▶ Waveform Encoder ─▶ (waveform_latent)
+
 ```
 
 ```
-Reconstruction Path (How to Visualize Sight, Imagination, and Dreams)
-Waveform ─▶ Waveform Encoder ─▶ z_waveform_latent ─▶ Image Decoder ─▶ Reconstructed Image
+Reconstruction Path (How to Visualize Sight, Imagination, and Dreams) (relay api)
+ waveform_latent ─▶ Image Decoder ─▶ Reconstructed Image
 ```
 
 ## Model Project Architecture
@@ -187,10 +562,10 @@ project/
 ├── data/
 │   ├── dataset.py             # Image + waveform loader
 ├── models/
-│   ├── image_encoder.py       # CNN (ResNet) image → z
-│   ├── waveform_decoder.py    # MLP z → waveform
-│   ├── waveform_encoder.py    # MLP waveform → z
-│   ├── image_decoder.py       # CNN decoder z → image
+│   ├── image_encoder.py       # CNN (ResNet) image -> image_latents
+│   ├── waveform_decoder.py    # MLP -> Synthetic Waveform
+│   ├── waveform_encoder.py    # MLP -> waveform_latents
+│   ├── image_decoder.py       # MLP -> reconstructed image
 │   ├── __init__.py            # Shared architecture utils
 ├── train.py                   # Trains everything (2 phases)
 ├── eval.py                    # Runs SSIM, PSNR, MSE
@@ -199,9 +574,64 @@ project/
 └── README.md                  # Usage + dependencies
 ```
 
+## Full-Stack Project Architecture
+```
+[Simulation API: WebSocket Server]
+┌─────────────────────────────┐
+│ Accept a random image       │
+│ └── image_encoder → latents │
+│     └── waveform_decoder    │
+│         └── Send to Relay   │
+└─────────────────────────────┘
 
-The ImageWaveformDataset does not have images. They are file paths and numpy waveforms. 
+[Relay API: WebSocket Server]
+┌────────────────────────────────┐
+│ Receive waveform_latent        │
+│ └── waveform_encoder → latents │
+│     └── image_decoder          │
+│         └── Buffer image       │
+│             └── Respond        │
+└────────────────────────────────┘
 
-There are approximately .5 million samples of numpy waveforms and image file paths. Each image is of size (320, 240). To load all the images will be memory inefficient. Please load the data in batches by loading the images and waveforms in batches using the file paths provided at each sample and use those to train the neural network. 
+[Frontend: React]
+┌───────────────────────────┐
+│ Thought-to-Image button   │
+│ └── Poll Relay API WS     │
+│     └── Receive image     │
+│         └── Display       │
+└───────────────────────────┘
 
-I need train.py. 
+```
+
+## Full-Stack Development Time:
+```
+| Task                                    | Time Estimate   |
+| --------------------------------------- | --------------- |
+| ✅ Webcam capture & preprocessing        | 0.5 hour        |
+| ✅ Integrate image encoder model         | 0.5 hour        |
+| ✅ Generate waveform latent              | 0.5 hour        |
+| ✅ Send waveform to relay via WebSocket  | 0.5 hour        |
+| ✅ Relay receives, decodes image         | 1.5 hours       |
+| ✅ Frontend polling WebSocket + image UI | 1.5 hours       |
+| ✅ Testing + debugging                   | 1.5 hours       |
+| **Total**                               | **\~7.5 hours** |
+```
+
+## Simulation -> Relay Message Format
+```
+{
+  "type": "waveform_latent",
+  "session_id": "xyz123",
+  "payload": [0.023, 0.55, ..., -0.011]  // z_waveform_latent vector
+}
+```
+
+## Relay -> Simulation Message Format
+```
+{
+  "type": "reconstructed_image",
+  "session_id": "xyz123",
+  "image_base64": "data:image/jpeg;base64,/9j/4AAQSk..."
+}
+```
+---
