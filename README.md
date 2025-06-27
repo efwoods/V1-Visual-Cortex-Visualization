@@ -48,7 +48,7 @@ https://www.youtube.com/watch?v=88I7gLR5v_A&list=PL9rU625vkl4XmGq7i-zZbVuVw3g5ez
   │  Image Encoder  │  (ResNet / ViT)
   └─────────────────┘
           ▼
-    z_image_latent ───────┐
+    image_latent_space ───┐
                           ▼
               ┌────────────────────┐
               │  Waveform Decoder  │ (MLP or 1D CNN)
@@ -60,7 +60,7 @@ https://www.youtube.com/watch?v=88I7gLR5v_A&list=PL9rU625vkl4XmGq7i-zZbVuVw3g5ez
               │  Waveform Encoder  │
               └────────────────────┘
                           ▼
-    z_waveform_latent ◄────── latent alignment loss ──────► z_image_latent
+    waveform_latent ◄────── latent alignment loss ──────► image_latent_space
                           ▼
               ┌──────────────────┐
               │  Image Decoder   │
@@ -69,14 +69,23 @@ https://www.youtube.com/watch?v=88I7gLR5v_A&list=PL9rU625vkl4XmGq7i-zZbVuVw3g5ez
                Reconstructed Image
 ```
 
+
+The simulation path may accept a real waveform or a synthetic waveform.
+The Image encoder, waveform decoder, waveform encoder, and image decoder are all individual modular models. 
+
 ```
-Simulation Path (How to See)
-Image ─▶ Image Encoder ─▶ z_image_latent ─▶ Waveform Decoder ─▶ Synthetic Waveform
+Simulation Path (How to See) (websocket api)
+Image ─▶ Image Encoder ─▶ image_latent_space ─▶ Waveform Decoder ─▶ Synthetic (or real) Waveform ─▶ Waveform Encoder ─▶ (waveform_latent)
+
+OR
+
+Synthetic (or real) Waveform ─▶ Waveform Encoder ─▶ (waveform_latent)
+
 ```
 
 ```
-Reconstruction Path (How to Visualize Sight, Imagination, and Dreams)
-Waveform ─▶ Waveform Encoder ─▶ z_waveform_latent ─▶ Image Decoder ─▶ Reconstructed Image
+Reconstruction Path (How to Visualize Sight, Imagination, and Dreams) (relay api)
+ waveform_latent ─▶ Image Decoder ─▶ Reconstructed Image
 ```
 
 ## Model Project Architecture
@@ -85,10 +94,10 @@ project/
 ├── data/
 │   ├── dataset.py             # Image + waveform loader
 ├── models/
-│   ├── image_encoder.py       # CNN (ResNet) image → z
-│   ├── waveform_decoder.py    # MLP z → waveform
-│   ├── waveform_encoder.py    # MLP waveform → z
-│   ├── image_decoder.py       # CNN decoder z → image
+│   ├── image_encoder.py       # CNN (ResNet) image -> image_latents
+│   ├── waveform_decoder.py    # MLP -> Synthetic Waveform
+│   ├── waveform_encoder.py    # MLP -> waveform_latents
+│   ├── image_decoder.py       # MLP -> reconstructed image
 │   ├── __init__.py            # Shared architecture utils
 ├── train.py                   # Trains everything (2 phases)
 ├── eval.py                    # Runs SSIM, PSNR, MSE
@@ -102,19 +111,19 @@ project/
 [Simulation API: WebSocket Server]
 ┌─────────────────────────────┐
 │ Accept a random image       │
-│ └── image_encoder → z       │
+│ └── image_encoder → latents │
 │     └── waveform_decoder    │
 │         └── Send to Relay   │
 └─────────────────────────────┘
 
 [Relay API: WebSocket Server]
-┌───────────────────────────┐
-│ Receive waveform_latent   │
-│ └── waveform_encoder → z  │
-│     └── image_decoder     │
-│         └── Buffer image  │
-│             └── Respond   │
-└───────────────────────────┘
+┌────────────────────────────────┐
+│ Receive waveform_latent        │
+│ └── waveform_encoder → latents │
+│     └── image_decoder          │
+│         └── Buffer image       │
+│             └── Respond        │
+└────────────────────────────────┘
 
 [Frontend: React]
 ┌───────────────────────────┐
