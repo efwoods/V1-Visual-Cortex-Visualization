@@ -28,7 +28,7 @@ import torchvision.utils as vutils
 PERCEPTUAL_WEIGHT = 0.1
 USE_PERCEPTUAL_LOSS = False  # Set True to enable
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-LOAD_FROM_CHECKPOINT = False
+LOAD_FROM_CHECKPOINT = True
 
 
 def load_all_from_checkpoint(
@@ -52,11 +52,14 @@ def load_all_from_checkpoint(
         torch.load(os.path.join(config["checkpoint_dir"], "waveform_decoder.pt"))
     )
     optimizer.load_state_dict(checkpoint["optimizer"])
-    return checkpoint["epoch"] + 1, checkpoint["best_val"]
+    return (
+        checkpoint["epoch"] + 1,
+        checkpoint["best_val"],
+        checkpoint.get("logdir", None),
+    )
 
 
 def save_all_to_checkpoint(
-    config,
     image_enc,
     wave_enc,
     image_dec,
@@ -64,6 +67,8 @@ def save_all_to_checkpoint(
     optimizer,
     epoch,
     best_val,
+    config,
+    logdir,
     path=None,
 ):
     os.makedirs(config["checkpoint_dir"], exist_ok=True)
@@ -73,6 +78,7 @@ def save_all_to_checkpoint(
         "optimizer": optimizer.state_dict(),
         "epoch": epoch,
         "best_val": best_val,
+        "logdir": config.get("logdir", logdir),  # Add this line
     }
     torch.save(checkpoint, path)
 
@@ -149,12 +155,16 @@ def log_side_by_side_images(
     writer.add_image(tag, grid, epoch)
 
 
-def main():
+def main(logdir=None):
 
     config = load_config()
+
     # TensorBoard
+    # Resume logdir if specified, else create new
     os.makedirs("runs", exist_ok=True)
-    logdir = os.path.join("runs", datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+    if logdir is None:
+        logdir = os.path.join("runs", datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+    os.makedirs(logdir, exist_ok=True)
     writer = SummaryWriter(logdir)
 
     # VGG for perceptual loss
@@ -247,7 +257,7 @@ def main():
     epochs_no_improve = 0
     start_epoch = 1
     if LOAD_FROM_CHECKPOINT:
-        start_epoch, best_val = load_all_from_checkpoint(
+        start_epoch, best_val, logdir = load_all_from_checkpoint(
             image_enc, wave_enc, image_dec, wave_dec, optimizer, config=config
         )
     for epoch in range(start_epoch, config["epochs"] + 1):
@@ -379,6 +389,7 @@ def main():
                 epoch=epoch,
                 best_val=best_val,
                 config=config,
+                logdir=logdir,
             )
 
         else:
