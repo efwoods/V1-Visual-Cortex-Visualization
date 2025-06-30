@@ -1,5 +1,6 @@
 # train.py
 import os
+import json
 import datetime
 import pickle
 import yaml
@@ -28,7 +29,7 @@ import torchvision.utils as vutils
 PERCEPTUAL_WEIGHT = 0.1
 USE_PERCEPTUAL_LOSS = False  # Set True to enable
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-LOAD_FROM_CHECKPOINT = True
+LOAD_FROM_CHECKPOINT = False
 
 
 def load_all_from_checkpoint(
@@ -159,6 +160,26 @@ def main(logdir=None):
 
     config = load_config()
 
+    # Normalize the waveform to global zero mean and unit variance
+    with open("electrode_global_mean_std.json", "r") as f:
+        electrode_stats = json.load(f)
+
+    # Convert to tensors for batch use
+    means = (
+        torch.tensor(
+            [electrode_stats[str(i)]["mean"] for i in range(len(electrode_stats))]
+        )
+        .float()
+        .to(DEVICE)
+    )
+    stds = (
+        torch.tensor(
+            [electrode_stats[str(i)]["std"] for i in range(len(electrode_stats))]
+        )
+        .float()
+        .to(DEVICE)
+    )
+
     # TensorBoard
     # Resume logdir if specified, else create new
     os.makedirs("runs", exist_ok=True)
@@ -224,7 +245,10 @@ def main(logdir=None):
 
     # Models
     image_enc = ImageEncoder(latent_dim=config["latent_dim"]).to(DEVICE)
-    image_dec = ImageDecoder(latent_dim=config["latent_dim"]).to(DEVICE)
+    image_dec = ImageDecoder(
+        latent_dim=config["latent_dim"],
+        skip_connections=True,
+    ).to(DEVICE)
     wave_dec = WaveformDecoder(latent_dim=config["latent_dim"]).to(DEVICE)
     wave_enc = WaveformEncoder(latent_dim=config["latent_dim"]).to(DEVICE)
 
@@ -270,10 +294,24 @@ def main(logdir=None):
         for imgs, waves in tqdm(train_loader, desc=f"Train {epoch}/{config['epochs']}"):
             imgs = imgs.to(DEVICE)
             waves = waves.to(DEVICE)
+            # print(f"waves.shape: {waves.shape}")
+            # print(f"means.shape = {means.shape}")
+            # print(f"stds.shape = {stds.shape}")
+            # Normalize to zero mean and unit variance
+            waves = (waves - means[None, :, None]) / stds[
+                None, :, None
+            ]  # Normalize per electrode
+
             # Encode image -> latent + skips
-            image_latent, skips = image_enc(imgs)  # Used for latent alignment loss
+            image_latent, skips = image_enc(
+                imgs
+            )  # Used for latent alignment loss; skip_connections are not used
             # Synthetic waveform -> latent
             synth_wave = wave_dec(image_latent)
+
+            # Denormalize for visualization purposes (or MSE between real waveform and synthetic)
+            # synth_wave = synth_wave * stds[None, :, None] + means[None, :, None]
+
             synthetic_waveform_latent = wave_enc(
                 synth_wave
             )  # Used for latent alignment loss between the image encoder and waveform encoder (both encodings encode into the same space)
@@ -329,6 +367,9 @@ def main(logdir=None):
             for imgs, waves in tqdm(val_loader, desc="Validate"):
                 imgs = imgs.to(DEVICE)
                 waves = waves.to(DEVICE)
+
+                # Normalize using the global mean and std
+                waves = (waves - means[None, :, None]) / stds[None, :, None]
                 image_latent, skips = image_enc(imgs)
                 real_waveform_latent = wave_enc(waves)
                 reconstructed_image = image_dec(real_waveform_latent, skips)

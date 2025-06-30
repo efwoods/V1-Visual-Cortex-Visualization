@@ -6,7 +6,10 @@ class WaveformEncoder(nn.Module):
     def __init__(self, latent_dim=128):
         super().__init__()
         self.encoder = nn.Sequential(
-            nn.Flatten(), nn.Linear(16 * 48, 256), nn.ReLU(), nn.Linear(256, latent_dim)
+            nn.Flatten(),
+            nn.Linear(16 * 48, 256),
+            nn.ReLU(),
+            nn.Linear(256, latent_dim),  # (batch_size = number_of_images, 128)
         )
 
     def forward(self, x):
