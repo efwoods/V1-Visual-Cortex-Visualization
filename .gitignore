@@ -1,4 +1,6 @@
-!/imgs/*
+!imgs/loss.png
+!imgs/reconstructed_images.png
+!imgs/*
 **/checkpoints
 **.png
 **/runs/
