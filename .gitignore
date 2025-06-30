@@ -1,6 +1,12 @@
+
+# Unignore the imgs folder
+!imgs/
+
+# But track these specific image files
 !imgs/loss.png
 !imgs/reconstructed_images.png
-!imgs/*
+
+
 **/checkpoints
 **.png
 **/runs/
